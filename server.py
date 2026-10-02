@@ -597,6 +597,33 @@ def _extract_images(body: str, limit: int) -> list[str]:
     return out
 
 
+_BING_MURL_RE = re.compile(r'(?:murl&quot;:&quot;|"murl":")(https?:[^"&]+)')
+_YANDEX_ORIG_RE = re.compile(r'"origUrl":"(https?:[^"]+)"')
+_PRECISE_PARSERS = {"bing": _BING_MURL_RE, "yandex": _YANDEX_ORIG_RE}
+
+
+def _parse_similar(engine: str, body: str, limit: int) -> tuple[list[str], str]:
+    """优先用引擎自身的相似图字段精准解析，拿不到再退回整页抓图。
+
+    返回 (图片直链列表, 质量标记)：structured = 来自引擎结构字段（可信），loose = 整页抓图（含装饰图噪音）。
+    """
+    pattern = _PRECISE_PARSERS.get(engine)
+    if pattern:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in pattern.findall(body or ""):
+            img = raw.replace("\\/", "/").replace("&amp;", "&")
+            if not img or img in seen:
+                continue
+            seen.add(img)
+            out.append(img)
+            if len(out) >= limit:
+                break
+        if out:
+            return out, "structured"
+    return _extract_images(body or "", limit), "loose"
+
+
 def search_images_so(query: str, limit: int) -> list[dict]:
     """360 图片：优先 JSON 接口，失败退回结果页解析。"""
     out: list[dict] = []
@@ -775,7 +802,7 @@ def reverse_image(image_url: str = "", filename: str = "", data: bytes = b"", li
 
     urls = _reverse_urls(public_url)
     for name, url in urls.items():
-        out["engines"][name] = {"result_url": url, "images": []}
+        out["engines"][name] = {"result_url": url, "images": [], "quality": "unknown"}
 
     def _grab(name: str):
         _, _, body = fetch(urls[name], 25)
@@ -788,11 +815,21 @@ def reverse_image(image_url: str = "", filename: str = "", data: bytes = b"", li
                 name, body = fut.result()
             except Exception:  # pragma: no cover
                 continue
-            images = _extract_images(body, limit) if name != "bing" else (_extract_images(body, limit) or [])
+            images, quality = _parse_similar(name, body, limit)
             out["engines"][name]["images"] = images
-            for img in images:
-                if img not in out["similar_images"]:
-                    out["similar_images"].append(img)
+            out["engines"][name]["quality"] = quality
+
+    # 汇总时让可信来源（引擎结构字段解析出的）排在前面，整页抓图的噪音排后面
+    ordered: list[str] = []
+    for want in ("structured", "loose"):
+        for name in urls:
+            if out["engines"][name].get("quality") == want:
+                ordered.extend(out["engines"][name]["images"])
+    dedup: list[str] = []
+    for img in ordered:
+        if img not in dedup:
+            dedup.append(img)
+    out["similar_images"] = dedup
     log(f"reverse: public={public_url} engines={len(out['engines'])} similar={len(out['similar_images'])}")
     return out
 
