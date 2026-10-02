@@ -40,7 +40,7 @@ docker run -d --name dsh-search-bridge --restart unless-stopped --network host \
 
 ## 接到 DSH 的"官方搜索"
 
-在 `$DSH_HOME/profiles/web/cordis.patch.yml` 追加（它会覆盖 searxng 插件对 `web` 行的覆盖）：
+在 `$DSH_HOME/profiles/web/cordis.patch.yml` 追加：
 
 ```yaml
 - id: web

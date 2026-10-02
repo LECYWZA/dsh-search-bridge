@@ -4,7 +4,7 @@ services:
     image: dsh-search-bridge:1.0.0
     container_name: dsh-search-bridge
     restart: unless-stopped
-    network_mode: host          # 与 searxng 一致：直接用宿主网络，DSH 侧访问 127.0.0.1:8090
+    network_mode: host          # 直接用宿主网络，DSH 侧访问 127.0.0.1:8090
     environment:
       # ---- 鉴权（必填）：DSH 侧要用同一个 key ----
       SEARCH_BRIDGE_KEYS: "${SEARCH_BRIDGE_KEYS:-changeme-please}"
