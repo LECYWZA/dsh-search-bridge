@@ -576,7 +576,7 @@ def search_images_bing(query: str, limit: int) -> list[dict]:
 
 
 _IMG_URL_RE = re.compile(r'https?:(?:\\/\\/|//)[^"\'\\ )<>]+?\.(?:jpg|jpeg|png|webp)', re.I)
-_IMG_BAD_HINTS = ("gstatic.com", "bing.com/th", "mm.bing.net/th", "favicon", "/s/a/rsslogo", "googlelogo")
+_IMG_BAD_HINTS = ("gstatic.com", "bing.com/th", "mm.bing.net/th", "favicon", "/s/a/rsslogo", "googlelogo", "yastatic.net", "logo")
 
 
 def _extract_images(body: str, limit: int) -> list[str]:
@@ -598,8 +598,8 @@ def _extract_images(body: str, limit: int) -> list[str]:
 
 
 _BING_MURL_RE = re.compile(r'(?:murl&quot;:&quot;|"murl":")(https?:[^"&]+)')
-_YANDEX_ORIG_RE = re.compile(r'"origUrl":"(https?:[^"]+)"')
-_PRECISE_PARSERS = {"bing": _BING_MURL_RE, "yandex": _YANDEX_ORIG_RE}
+_YANDEX_IMG_URL_RE = re.compile(r'"img_url":"([^"]+)"')   # 可能是转义形式，取出后再归一化
+_PRECISE_PARSERS = {"bing": _BING_MURL_RE, "yandex": _YANDEX_IMG_URL_RE}
 
 
 def _parse_similar(engine: str, body: str, limit: int) -> tuple[list[str], str]:
@@ -613,7 +613,7 @@ def _parse_similar(engine: str, body: str, limit: int) -> tuple[list[str], str]:
         seen: set[str] = set()
         for raw in pattern.findall(body or ""):
             img = raw.replace("\\/", "/").replace("&amp;", "&")
-            if not img or img in seen:
+            if not img.startswith("http") or img in seen:
                 continue
             seen.add(img)
             out.append(img)
