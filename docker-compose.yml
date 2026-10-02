@@ -1,0 +1,24 @@
+services:
+  dsh-search-bridge:
+    build: .
+    image: dsh-search-bridge:1.0.0
+    container_name: dsh-search-bridge
+    restart: unless-stopped
+    network_mode: host          # 与 searxng 一致：直接用宿主网络，DSH 侧访问 127.0.0.1:8090
+    environment:
+      # ---- 鉴权（必填）：DSH 侧要用同一个 key ----
+      SEARCH_BRIDGE_KEYS: "${SEARCH_BRIDGE_KEYS:-changeme-please}"
+      # ---- 检索 ----
+      SEARCH_ENGINES: "sogou,baidu,bing"
+      SEARCH_LIMIT: "10"
+      SEARCH_TIMEOUT: "12"
+      RESOLVE_LINKS: "1"
+      # ---- 大脑：用本地大模型改写查询、多轮检索（零 API 费用）----
+      BRAIN_ENABLED: "1"
+      BRAIN_BASE_URL: "${BRAIN_BASE_URL:-http://192.168.1.1:8888/v1}"
+      BRAIN_API_KEY: "${BRAIN_API_KEY:-}"
+      BRAIN_MODEL: "deepseek-v4.1-flash"
+      BRAIN_MAX_ROUNDS: "3"
+      BRAIN_TIMEOUT: "25"
+      # ---- 监听 ----
+      LISTEN_PORT: "8090"
