@@ -37,7 +37,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -80,8 +80,11 @@ CFG = {
     "keys": [k.strip() for k in env("SEARCH_BRIDGE_KEYS", "").split(",") if k.strip()],
     "allow_anon": env_bool("SEARCH_BRIDGE_ALLOW_ANON", False),
     # 检索
-    # 顺序即优先级：中文场景 sogou/baidu 明显优于 bing（bing 中文分词差）
-    "engines": [e.strip().lower() for e in env("SEARCH_ENGINES", "sogou,baidu,bing").split(",") if e.strip()],
+    # 顺序即优先级：中文场景 sogou/baidu 明显优于 bing（bing 中文分词差）。
+    # so360/wikipedia 实测可用；google/toutiao 是"尽力"通道（无 JS 时结果页可能为空）。
+    "engines": [e.strip().lower() for e in env(
+        "SEARCH_ENGINES", "sogou,baidu,bing,so360,wikipedia,google,toutiao"
+    ).split(",") if e.strip()],
     "limit": env_int("SEARCH_LIMIT", 10),
     "engine_timeout": env_float("SEARCH_TIMEOUT", 12.0),
     "resolve_links": env_bool("RESOLVE_LINKS", True),
@@ -412,13 +415,386 @@ def search_brave(query: str, limit: int) -> list[dict]:
     return out
 
 
+def search_so360(query: str, limit: int) -> list[dict]:
+    """360 搜索（so.com）。结果标题在 h3.res-title / h3.g-title 里。"""
+    url = f"https://www.so.com/s?q={quote(query)}&pn=1"
+    _, _, body = fetch(url, CFG["engine_timeout"])
+    if not body:
+        return []
+    out: list[dict] = []
+    pattern = re.compile(
+        r'<h3[^>]*class="[^"]*(?:res-title|g-title)[^"]*"[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        re.S,
+    )
+    for mt in pattern.finditer(body):
+        href, title = urljoin("https://www.so.com", mt.group(1)), mt.group(2)
+        window = body[mt.end(): mt.end() + 2000]
+        ms = re.search(r'<p[^>]*class="[^"]*(?:res-desc|res-rich|res-intro)[^"]*"[^>]*>(.*?)</p>', window, re.S)
+        snippet = ms.group(1) if ms else _fallback_snippet(window, clean_text(title))
+        item = _mk("so360", title, href, snippet)
+        if item:
+            out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def search_wikipedia(query: str, limit: int) -> list[dict]:
+    """维基百科 API（免 key，适合事实/名词类查询）。"""
+    url = (
+        "https://zh.wikipedia.org/w/api.php?action=query&list=search&format=json&utf8=1"
+        f"&srlimit={max(limit, 5)}&srsearch={quote(query)}"
+    )
+    _, _, body = fetch(url, CFG["engine_timeout"])
+    if not body:
+        return []
+    try:
+        rows = (json.loads(body).get("query") or {}).get("search") or []
+    except ValueError:
+        return []
+    out: list[dict] = []
+    for row in rows[:limit]:
+        title = row.get("title") or ""
+        page = "https://zh.wikipedia.org/wiki/" + quote(title.replace(" ", "_"))
+        item = _mk("wikipedia", title, page, row.get("snippet") or "")
+        if item:
+            out.append(item)
+    return out
+
+
+def _search_links(engine: str, body: str, limit: int, skip_host: str) -> list[dict]:
+    """宽松提取：从页面里捞"外链+链接文本"当结果（用于结构多变/JS 渲染的引擎）。"""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for mt in re.finditer(r'<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>', body or "", re.S):
+        href, text = mt.group(1), clean_text(mt.group(2))
+        if len(text) < 8 or skip_host in urlparse(href).netloc or href in seen:
+            continue
+        seen.add(href)
+        item = _mk(engine, text, href, "")
+        if item:
+            out.append(item)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def search_google(query: str, limit: int) -> list[dict]:
+    """Google 网页（尽力而为：无 JS 时结果页常被简化，抓不到就返回空）。"""
+    url = f"https://www.google.com/search?hl=zh-CN&num={max(limit * 2, 20)}&q={quote(query)}"
+    _, _, body = fetch(url, CFG["engine_timeout"], headers={"Accept-Language": "zh-CN,zh;q=0.9"})
+    return _search_links("google", body, limit, "google.")
+
+
+def search_toutiao(query: str, limit: int) -> list[dict]:
+    """头条搜索（尽力而为：页面很大，宽松提取外链标题）。"""
+    url = f"https://so.toutiao.com/search?keyword={quote(query)}&pd=synthesis"
+    _, _, body = fetch(url, CFG["engine_timeout"])
+    return _search_links("toutiao", body, limit, "toutiao.com")
+
+
 ENGINES = {
     "bing": search_bing,
     "sogou": search_sogou,
     "baidu": search_baidu,
     "mojeek": search_mojeek,
     "brave": search_brave,
+    "so360": search_so360,
+    "wikipedia": search_wikipedia,
+    "google": search_google,
+    "toutiao": search_toutiao,
 }
+
+
+# --------------------------------------------------------------------------
+# 图片搜索（关键词搜图）
+# --------------------------------------------------------------------------
+
+IMG_SEARCH_ENGINES: dict = {}
+
+
+def search_images_baidu(query: str, limit: int) -> list[dict]:
+    """百度图片 JSON 接口（需 Referer）。"""
+    url = (
+        "https://image.baidu.com/search/acjson?tn=resultjson_com&ipn=rj&nc=1"
+        f"&word={quote(query)}&pn=0&rn={max(limit, 10)}"
+    )
+    _, _, body = fetch(url, CFG["engine_timeout"], headers={
+        "Referer": "https://image.baidu.com/",
+        "Accept": "application/json, text/plain, */*",
+    })
+    if not body:
+        return []
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return []
+    out: list[dict] = []
+    for row in data.get("data") or []:
+        if not isinstance(row, dict):
+            continue
+        image = row.get("middleURL") or row.get("hoverURL") or row.get("thumbURL")
+        if not image:
+            continue
+        out.append({
+            "engine": "baidu",
+            "title": clean_text(row.get("fromPageTitleEnc") or row.get("queryExt") or ""),
+            "image_url": image,
+            "thumb_url": row.get("thumbURL") or image,
+            "source_url": row.get("fromURL") or "",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def search_images_bing(query: str, limit: int) -> list[dict]:
+    """Bing 图片异步接口（页面内嵌 JSON 的 murl 即原图直链）。"""
+    url = f"https://cn.bing.com/images/async?q={quote(query)}&first=1&count={max(limit * 2, 20)}&mkt=zh-CN"
+    _, _, body = fetch(url, CFG["engine_timeout"])
+    if not body:
+        return []
+    out: list[dict] = []
+    for raw in re.findall(r'm="([^"]+)"', body):
+        try:
+            row = json.loads(html_mod.unescape(raw))
+        except ValueError:
+            continue
+        image = row.get("murl")
+        if not image:
+            continue
+        out.append({
+            "engine": "bing",
+            "title": clean_text(row.get("t") or ""),
+            "image_url": image,
+            "thumb_url": row.get("turl") or image,
+            "source_url": row.get("purl") or "",
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+_IMG_URL_RE = re.compile(r'https?:(?:\\/\\/|//)[^"\'\\ )<>]+?\.(?:jpg|jpeg|png|webp)', re.I)
+_IMG_BAD_HINTS = ("gstatic.com", "bing.com/th", "mm.bing.net/th", "favicon", "/s/a/rsslogo", "googlelogo")
+
+
+def _extract_images(body: str, limit: int) -> list[str]:
+    """从页面里尽力抓图片直链（用于识图结果页这种 JS 渲染页面）。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in _IMG_URL_RE.findall(body or ""):
+        img = raw.replace("\\/", "/").replace("&amp;", "&")
+        low = img.lower()
+        if any(bad in low for bad in _IMG_BAD_HINTS):
+            continue
+        if img in seen:
+            continue
+        seen.add(img)
+        out.append(img)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def search_images_so(query: str, limit: int) -> list[dict]:
+    """360 图片：优先 JSON 接口，失败退回结果页解析。"""
+    out: list[dict] = []
+    _, _, body = fetch(f"https://image.so.com/j?q={quote(query)}&pn=0&rn={max(limit, 10)}&src=srp", CFG["engine_timeout"])
+    if body and body.lstrip().startswith("{"):
+        try:
+            for row in (json.loads(body).get("list") or []):
+                image = row.get("img") or row.get("thumb")
+                if not image:
+                    continue
+                out.append({
+                    "engine": "so360",
+                    "title": clean_text(row.get("title") or ""),
+                    "image_url": image,
+                    "thumb_url": row.get("thumb") or image,
+                    "source_url": row.get("link") or "",
+                })
+                if len(out) >= limit:
+                    break
+        except (ValueError, AttributeError):
+            out = []
+    if not out:
+        _, _, page = fetch(f"https://image.so.com/i?q={quote(query)}&src=srp", CFG["engine_timeout"])
+        for image in _extract_images(page, limit):
+            out.append({"engine": "so360", "title": "", "image_url": image, "thumb_url": image, "source_url": ""})
+    return out
+
+
+def search_images_google(query: str, limit: int) -> list[dict]:
+    """Google 图片（尽力而为：抓结果页里的图片直链）。"""
+    url = f"https://www.google.com/search?tbm=isch&hl=zh-CN&q={quote(query)}"
+    _, _, body = fetch(url, CFG["engine_timeout"], headers={"Accept-Language": "zh-CN,zh;q=0.9"})
+    return [{"engine": "google", "title": "", "image_url": img, "thumb_url": img, "source_url": ""}
+            for img in _extract_images(body or "", limit)]
+
+
+def search_images_yandex(query: str, limit: int) -> list[dict]:
+    """Yandex 图片。"""
+    url = f"https://yandex.com/images/search?text={quote(query)}"
+    _, _, body = fetch(url, CFG["engine_timeout"])
+    return [{"engine": "yandex", "title": "", "image_url": img, "thumb_url": img, "source_url": ""}
+            for img in _extract_images(body or "", limit)]
+
+
+IMG_SEARCH_ENGINES = {
+    "baidu": search_images_baidu,
+    "bing": search_images_bing,
+    "so360": search_images_so,
+    "google": search_images_google,
+    "yandex": search_images_yandex,
+}
+
+
+def search_images(query: str, engines: list[str] | None = None, limit: int | None = None) -> list[dict]:
+    """关键词搜图：并发跑多家图片引擎，合并去重。"""
+    query = (query or "").strip()
+    if not query:
+        return []
+    limit = limit or CFG["limit"]
+    chosen = [e for e in (engines or ["baidu", "bing", "so360", "google", "yandex"]) if e in IMG_SEARCH_ENGINES]
+    if not chosen:
+        chosen = ["baidu", "bing"]
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=len(chosen)) as pool:
+        futures = {pool.submit(IMG_SEARCH_ENGINES[name], query, limit): name for name in chosen}
+        for fut in as_completed(futures, timeout=CFG["engine_timeout"] + 8):
+            name = futures[fut]
+            try:
+                results.extend(fut.result() or [])
+            except Exception as exc:  # pragma: no cover
+                log(f"image engine {name} error: {exc}")
+    merged: list[dict] = []
+    seen: set[str] = set()
+    for item in results:
+        if item["image_url"] in seen:
+            continue
+        seen.add(item["image_url"])
+        merged.append(item)
+    log(f"images: {len(merged)} hits for {query!r} via {chosen}")
+    return merged[: max(limit * 2, 12)]
+
+
+# --------------------------------------------------------------------------
+# 以图搜图（Google / 微软 / 百度 / 搜狗 / 360 / Yandex）
+# --------------------------------------------------------------------------
+
+REVERSE_ENGINES = ("google", "bing", "baidu", "sogou", "so360", "yandex", "tineye")
+
+
+def _reverse_urls(public_url: str) -> dict:
+    """各家的"以图搜图"入口（把公网图片 URL 交给它们）。"""
+    enc = quote(public_url, safe="")
+    return {
+        "google": f"https://lens.google.com/uploadbyurl?url={enc}",
+        "bing": f"https://www.bing.com/images/searchbyimage?cbir=sbi&imgurl={enc}",
+        "baidu": f"https://graph.baidu.com/details?isfromtusoupc=1&tn=pc&carousel=1&image={enc}",
+        "sogou": f"https://pic.sogou.com/ris?query={enc}&flag=1",
+        "so360": f"https://image.so.com/i?q={enc}&src=srp",
+        "yandex": f"https://yandex.com/images/search?rpt=imageview&url={enc}",
+        "tineye": f"https://tineye.com/search?url={enc}",
+    }
+
+
+def _build_multipart(boundary: str, field: str, filename: str, data: bytes) -> bytes:
+    head = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8")
+    return head + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+
+def _parse_multipart(body: bytes, content_type: str) -> dict:
+    """极简 multipart/form-data 解析，返回 {字段名: (文件名, 字节)}。"""
+    match = re.search(r"boundary=([^;]+)", content_type or "")
+    if not match:
+        return {}
+    boundary = ("--" + match.group(1).strip().strip('"')).encode("utf-8")
+    out: dict = {}
+    for part in body.split(boundary):
+        if not part or part.strip() in (b"", b"--"):
+            continue
+        head, _, data = part.partition(b"\r\n\r\n")
+        if not data:
+            continue
+        header = head.decode("utf-8", errors="replace")
+        name = re.search(r'name="([^"]+)"', header)
+        if not name:
+            continue
+        fname = re.search(r'filename="([^"]*)"', header)
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+        out[name.group(1)] = (fname.group(1) if fname else None, data)
+    return out
+
+
+def _upload_image(filename: str, data: bytes) -> str:
+    """把图片传免费图床换公网直链（各家识图接口都只吃公网 URL）。"""
+    for host in ("uguu", "tmpfiles"):
+        boundary = "----dshbridge" + uuid.uuid4().hex[:12]
+        if host == "uguu":
+            url, field, name = "https://uguu.se/upload?output=text", "files[]", "image.jpg"
+        else:
+            url, field, name = "https://tmpfiles.org/api/v1/upload", "file", "image.jpg"
+        payload = _build_multipart(boundary, field, filename or name, data)
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}", "User-Agent": DEFAULT_UA}
+        try:
+            with _OPENER.open(Request(url, data=payload, headers=headers), timeout=40) as resp:
+                text = resp.read().decode("utf-8", errors="replace").strip()
+        except Exception as exc:
+            log(f"image host {host} failed: {exc}")
+            continue
+        if text.startswith("http"):
+            return text.split()[0]
+        try:
+            parsed = json.loads(text)
+            if parsed.get("status") == "success":
+                return str(parsed["data"]["url"]).replace("tmpfiles.org/", "tmpfiles.org/dl/")
+        except (ValueError, KeyError, TypeError):
+            pass
+    return ""
+
+
+def reverse_image(image_url: str = "", filename: str = "", data: bytes = b"", limit: int = 8) -> dict:
+    """以图搜图：给公网图片 URL，或上传二进制（服务端自动转图床）。
+
+    返回每家引擎的结果页 URL（可点开/可截图）＋尽力解析出的相似图直链。
+    """
+    public_url = (image_url or "").strip()
+    if not public_url and data:
+        public_url = _upload_image(filename or "image.jpg", data)
+    out: dict = {"public_url": public_url, "engines": {}, "similar_images": []}
+    if not public_url:
+        out["error"] = "no image: pass ?url=<public image url> or upload a form field named 'image'"
+        return out
+
+    urls = _reverse_urls(public_url)
+    for name, url in urls.items():
+        out["engines"][name] = {"result_url": url, "images": []}
+
+    def _grab(name: str):
+        _, _, body = fetch(urls[name], 25)
+        return name, body or ""
+
+    with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+        futures = [pool.submit(_grab, name) for name in urls]
+        for fut in as_completed(futures, timeout=45):
+            try:
+                name, body = fut.result()
+            except Exception:  # pragma: no cover
+                continue
+            images = _extract_images(body, limit) if name != "bing" else (_extract_images(body, limit) or [])
+            out["engines"][name]["images"] = images
+            for img in images:
+                if img not in out["similar_images"]:
+                    out["similar_images"].append(img)
+    log(f"reverse: public={public_url} engines={len(out['engines'])} similar={len(out['similar_images'])}")
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -459,7 +835,7 @@ def run_search(query: str, engines: list[str] | None = None, limit: int | None =
     priority = {name: idx for idx, name in enumerate(chosen)}
 
     results: list[dict] = []
-    with ThreadPoolExecutor(max_workers=min(6, len(chosen))) as pool:
+    with ThreadPoolExecutor(max_workers=min(8, len(chosen))) as pool:
         futures = {pool.submit(ENGINES[name], query, limit): name for name in chosen}
         for fut in as_completed(futures, timeout=CFG["engine_timeout"] + 8):
             name = futures[fut]
@@ -728,9 +1104,45 @@ class Handler(BaseHTTPRequestHandler):
                 "service": "dsh-search-bridge",
                 "version": VERSION,
                 "engines": [e for e in CFG["engines"] if e in ENGINES],
-                "endpoints": ["POST /v1/messages", "GET /search?q=...&engines=bing,sogou&limit=10", "GET /healthz"],
+                "image_engines": list(IMG_SEARCH_ENGINES),
+                "reverse_engines": list(REVERSE_ENGINES),
+                "endpoints": [
+                    "POST /v1/messages",
+                    "GET /search?q=...&engines=bing,sogou&limit=10",
+                    "GET /image?q=...&engines=baidu,bing,so360&limit=10",
+                    "GET /reverse?url=<public image url>",
+                    'POST /reverse  (multipart image=@file, or JSON {"url":"..."})',
+                    "GET /healthz",
+                ],
                 "brain": {"enabled": brain_available(), "base": CFG["brain_base"], "model": CFG["brain_model"]},
             })
+        if parsed.path == "/image":
+            if not check_auth(self):
+                return self._send(401, {"error": "unauthorized: missing or invalid api key"})
+            params = parse_qs(parsed.query)
+            query = (params.get("q") or [""])[0].strip()
+            if not query:
+                return self._send(400, {"error": "missing q"})
+            limit = int((params.get("limit") or [str(CFG["limit"])])[0] or CFG["limit"])
+            engines = [e.strip().lower() for e in (params.get("engines") or [""])[0].split(",") if e.strip()] or None
+            started = time.monotonic()
+            images = search_images(query, engines=engines, limit=limit)
+            return self._send(200, {
+                "query": query,
+                "engines": engines or list(IMG_SEARCH_ENGINES),
+                "count": len(images),
+                "elapsed": round(time.monotonic() - started, 2),
+                "images": images,
+            })
+        if parsed.path == "/reverse":
+            if not check_auth(self):
+                return self._send(401, {"error": "unauthorized: missing or invalid api key"})
+            params = parse_qs(parsed.query)
+            image_url = (params.get("url") or [""])[0].strip()
+            if not image_url:
+                return self._send(400, {"error": "missing url (or POST a multipart 'image' file)"})
+            limit = int((params.get("limit") or ["8"])[0] or 8)
+            return self._send(200, reverse_image(image_url=image_url, limit=limit))
         if parsed.path not in ("/search", "/"):
             return self._send(404, {"error": "not found"})
         if not check_auth(self):
@@ -753,6 +1165,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if parsed.path == "/reverse":
+            if not check_auth(self):
+                return self._send(401, {"error": {"type": "authentication_error", "message": "invalid api key"}})
+            ctype = self.headers.get("content-type", "") or ""
+            if ctype.startswith("multipart/form-data"):
+                length = int(self.headers.get("content-length", "0") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+                fields = _parse_multipart(raw, ctype)
+                filename, data = fields.get("image") or (None, b"")
+                if not data:
+                    return self._send(400, {"error": "empty or missing 'image' file field"})
+                return self._send(200, reverse_image(filename=filename or "image.jpg", data=data))
+            payload = self._read_json()
+            return self._send(200, reverse_image(image_url=str(payload.get("url") or "")))
         if parsed.path not in ("/v1/messages", "/messages"):
             return self._send(404, {"error": "not found"})
         if not check_auth(self):

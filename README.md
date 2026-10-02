@@ -9,11 +9,17 @@ DSH 侧只改配置（不改插件、不加 MCP），搜索就由本服务完成
 | 接口 | 说明 |
 |---|---|
 | `POST /v1/messages` | Anthropic Messages 兼容层。实现服务端 `web_search` 工具语义，返回 `web_search_tool_result` 结果块，DSH 的 `dsh-web-search-deepseek` provider 可直接指向它 |
-| `GET /search?q=…&engines=bing,sogou&limit=10` | 通用 JSON 搜索接口（便于调试、也可给别的程序用） |
+| `GET /search?q=…&engines=…&limit=10` | 网页搜索（JSON） |
+| `GET /image?q=…&engines=…&limit=10` | **关键词搜图**：返回图片直链、缩略图与来源页 |
+| `GET /reverse?url=<公网图片URL>` | **以图搜图**：返回各引擎识图结果页 URL + 尽力解析出的相似图直链 |
+| `POST /reverse` | 同上，但直接上传图片（`multipart/form-data`，字段名 `image`），服务端自动转图床 |
 | `GET /healthz` | 健康检查（不需要密钥） |
 
-检索引擎：`sogou`、`baidu`、`bing`（内置直抓，免 key、国内直连），可选 `mojeek`、`brave`（需 `BRAVE_API_KEY`）。
-跳转链接会自动解析成真实地址；同名结果会去重、按引擎优先级与相关性排序。
+网页引擎：`sogou`、`baidu`、`bing`、`so360`、`wikipedia`（实测可用）；`google`、`toutiao` 为尽力通道（无 JS 时结果页可能为空）；可选 `mojeek`、`brave`（需 `BRAVE_API_KEY`）。
+图片引擎：`baidu`、`bing`、`so360`、`google`、`yandex`。
+以图搜图：`google`(Lens)、`bing`、`baidu`、`sogou`、`so360`、`yandex`、`tineye` —— 一次调用可拿到 20+ 张相似图直链（实测 28 张）。
+
+跳转链接会自动解析成真实地址；结果会去重、按引擎优先级与相关性排序。
 
 "大脑"：可选调用本地大模型（默认走 OpenWrt 上的 `http://192.168.1.1:8888/v1` → Spark sglang）把自然语言意图
 拆解成检索词并可多轮搜索，最终结果由服务自己汇总 —— 这就是"官方搜索"的机制，只是模型跑在你自己机器上。
@@ -37,6 +43,18 @@ docker run -d --name dsh-search-bridge --restart unless-stopped --network host \
   -e BRAIN_BASE_URL=http://192.168.1.1:8888/v1 -e BRAIN_API_KEY=luojiecong \
   dsh-search-bridge:1.0.0
 ```
+
+## 用法示例
+
+```bash
+KEY=你的密钥
+curl -s -H "x-api-key: $KEY" 'http://127.0.0.1:8090/search?q=关键词&limit=10'           # 网页搜索
+curl -s -H "x-api-key: $KEY" 'http://127.0.0.1:8090/image?q=大熊猫&limit=10'            # 关键词搜图
+curl -s -H "x-api-key: $KEY" -F 'image=@/path/to/pic.jpg' http://127.0.0.1:8090/reverse # 以图搜图（上传图片）
+curl -s -H "x-api-key: $KEY" 'http://127.0.0.1:8090/reverse?url=<公网图片URL>'          # 以图搜图（给 URL）
+```
+
+`/reverse` 返回结构：`engines.<名称>.result_url`（可点开的结果页）与 `engines.<名称>.images`（解析到的相似图直链），以及汇总的 `similar_images`。
 
 ## 接到 DSH 的"官方搜索"
 
